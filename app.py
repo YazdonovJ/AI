@@ -1,218 +1,162 @@
-# app.py — Telegram bot (group-only + mention/reply gating), PTB v20+
+# app.py - Main application file for the Telegram Bot
 import os
 import logging
-from typing import Optional
+from collections import defaultdict
+from functools import wraps
 
-from telegram import Update, error
-from telegram.constants import ChatType
+# Third-party libraries
+from dotenv import load_dotenv
+from telegram import Update, constants
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ChatMemberHandler, ContextTypes, filters
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-# ── ENV ────────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-XAI_API_KEY    = os.getenv("XAI_API_KEY", "").strip()
-XAI_MODEL      = os.getenv("XAI_MODEL", "grok-3-mini").strip()
+# Local imports
+from grok_client import GrokClient, GrokError
 
-# DMs policy: "ignore" (default) or "warn"
-DM_POLICY  = os.getenv("DM_POLICY", "ignore").strip().lower()  # ignore | warn
-# Group reply gating: reply_or_mention | mention | all
-REPLY_MODE = os.getenv("REPLY_MODE", "reply_or_mention").strip().lower()
+# ── SETUP ──────────────────────────────────────────────────────────────────────
+# Load environment variables from .env file
+load_dotenv()
 
-if not TELEGRAM_TOKEN:
-    raise SystemExit("Set TELEGRAM_TOKEN in your environment.")
+# Basic logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+LOGGER = logging.getLogger(__name__)
 
-# ── LOGGING ────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-for n in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
-    logging.getLogger(n).setLevel(logging.WARNING)
-log = logging.getLogger("group-only-bot")
+# Environment Variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+ALLOWED_USERS = [int(user_id) for user_id in os.getenv("ALLOWED_USERS", "").split(",") if user_id]
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+if not TELEGRAM_TOKEN or not XAI_API_KEY:
+    raise ValueError("TELEGRAM_TOKEN and XAI_API_KEY must be set in the environment.")
 
-# ── UTIL: group-only decorator ────────────────────────────────────────────────
-def group_only(handler_func):
-    """Allow handler to run only in group/supergroup. For DMs: ignore or warn."""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat = update.effective_chat
-        ctype = getattr(chat, "type", None)
-        if ctype in GROUP_TYPES:
-            return await handler_func(update, context)
+# Initialize Grok Client
+grok_client = GrokClient(api_key=XAI_API_KEY)
 
-        # Private (DM) path
-        if DM_POLICY == "warn" and update.effective_message:
-            try:
-                await update.effective_message.reply_text(
-                    "I only work in group chats. Add me to a group and mention me there. 😊"
-                )
-            except Exception as e:
-                log.debug(f"Failed to send DM warning: {e}")
-        return
-    return wrapper
+# In-memory conversation history
+conversation_history = defaultdict(list)
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def _mentioned(bot_username: str, update: Update) -> bool:
-    """True if message mentions @bot_username (entity or text_mention)."""
-    msg = update.effective_message
-    if not msg or not msg.text:
-        return False
-
-    # entity-based mention
-    for e in (msg.entities or []):
-        if e.type == "mention":
-            if msg.parse_entity(e).lstrip("@").lower() == bot_username.lower():
-                return True
-        elif e.type == "text_mention":
-            if getattr(e.user, "username", "").lower() == bot_username.lower():
-                return True
-
-    # fallback substring check
-    return f"@{bot_username.lower()}" in msg.text.lower()
-
-# ── (Optional) LLM call stub ──────────────────────────────────────────────────
-async def call_xai(prompt: str) -> str:
-    """Replace with real xAI/Grok call if desired."""
-    return f"Echo: {prompt[:400]}"
-
-# ── HANDLERS ──────────────────────────────────────────────────────────────────
-@group_only
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hello, group! I respond only in groups.\n"
-        "Default behavior: reply when you @mention me or reply to my message.\n"
-        "Try /help for commands."
-    )
-
-@group_only
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start — check bot status\n"
-        "/ping — quick health check\n"
-        "Talk to me by replying to my message or @mentioning my username."
-    )
-
-@group_only
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Pong ✅")
-
-@group_only
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg or not (msg.text or "").strip():
-        return
-
-    # ignore other bots / self
-    if msg.from_user and msg.from_user.is_bot:
-        return
-
-    # decide if we should reply
-    should_reply = False
-    mode = REPLY_MODE
-    me = await context.bot.get_me()
-    bot_username = me.username or ""
-
-    if mode == "all":
-        should_reply = True
-    elif mode == "mention":
-        should_reply = _mentioned(bot_username, update)
-    else:  # reply_or_mention (default)
-        replied_to_bot = (
-            msg.reply_to_message
-            and msg.reply_to_message.from_user
-            and msg.reply_to_message.from_user.id == context.bot.id
-        )
-        should_reply = replied_to_bot or _mentioned(bot_username, update)
-
-    if not should_reply:
-        return  # stay silent
-
-    text = msg.text.strip()
-    reply = await call_xai(text)
-    if reply:
-        await msg.reply_text(reply)
-
-async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    """Log Errors and provide specific feedback for network issues."""
-    # This is the most likely error you are facing.
-    if isinstance(context.error, error.NetworkError):
-        log.error(
-            "A network error occurred. This is likely a connectivity issue. "
-            "Please check the server's internet connection and firewall settings. Error: %s",
-            context.error
-        )
-    else:
-        # For all other errors, log them as exceptions.
-        log.error("Exception while handling an update:", exc_info=context.error)
-
-
-# Fires when the bot is added/removed (my_chat_member update)
-async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    cmu = update.my_chat_member  # ChatMemberUpdated
+# ── HELPERS & DECORATORS ───────────────────────────────────────────────────────
+def load_instruction(filename: str) -> str:
+    """Loads instruction text from a file."""
     try:
-        new = cmu.new_chat_member
-        if new.status in ("member", "administrator"):
-            if chat and chat.type in GROUP_TYPES:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text="Thanks for adding me! I respond only in this group. Type /help to begin."
-                )
-    except Exception:
-        pass
+        with open(filename, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        LOGGER.warning("Instruction file not found: %s", filename)
+        return ""
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# Load system instructions from files
+INST_PRIVATE = load_instruction("inst_private.txt")
+INST_GROUP = load_instruction("inst_group.txt")
+INST_DEFAULT = load_instruction("inst_default.txt")
+
+def user_is_allowed(func):
+    """Decorator to restrict access to allowed users only."""
+    @wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+            await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+            LOGGER.warning("Unauthorized access attempt by user_id: %s", user_id)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
+
+# ── COMMAND HANDLERS ───────────────────────────────────────────────────────────
+@user_is_allowed
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /start command."""
+    await update.message.reply_text("Hello! I'm a bot powered by Grok. Talk to me!")
+
+@user_is_allowed
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /help command."""
+    await update.message.reply_text(
+        "Available commands:\n"
+        "/start - Start the conversation\n"
+        "/new - Clear conversation history\n"
+        "/help - Show this help message"
+    )
+
+@user_is_allowed
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /new command to clear conversation history."""
+    chat_id = update.effective_chat.id
+    if chat_id in conversation_history:
+        del conversation_history[chat_id]
+        await update.message.reply_text("Conversation history cleared.")
+    else:
+        await update.message.reply_text("No active conversation to clear.")
+
+# ── MESSAGE HANDLER ────────────────────────────────────────────────────────────
+@user_is_allowed
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all non-command text messages."""
+    chat_id = update.effective_chat.id
+    user_message = update.message.text
+
+    # Determine which system instruction to use
+    is_private_chat = update.effective_chat.type == constants.ChatType.PRIVATE
+    if is_private_chat:
+        system_prompt = INST_PRIVATE or INST_DEFAULT
+    else: # Group chat
+        system_prompt = INST_GROUP or INST_DEFAULT
+
+    # Add user message to history
+    conversation_history[chat_id].append({"role": "user", "content": user_message})
+
+    # Show a "typing..." status to the user
+    await context.bot.send_chat_action(
+        chat_id=chat_id, action=constants.ChatAction.TYPING
+    )
+
+    try:
+        # Get response from Grok
+        response_text = await grok_client.generate(
+            system_prompt=system_prompt,
+            messages=conversation_history[chat_id]
+        )
+
+        # Add assistant's response to history
+        conversation_history[chat_id].append({"role": "assistant", "content": response_text})
+
+        # Send the response back to the user
+        await update.message.reply_text(response_text)
+
+    except GrokError as e:
+        LOGGER.error("Grok API Error: %s", e)
+        await update.message.reply_text(f"Sorry, I encountered an error with the AI model: {e}")
+    except Exception as e:
+        LOGGER.error("An unexpected error occurred: %s", e, exc_info=True)
+        await update.message.reply_text("An unexpected error occurred. Please try again later.")
+
+
+# ── MAIN ───────────────────────────────────────────────────────────────────────
 def main():
-    # ADDED: Timeouts to the application builder for network resilience.
-    # This prevents the bot from hanging indefinitely if Telegram's API is unresponsive.
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .connect_timeout(10)  # Timeout for establishing a connection
-        .read_timeout(10)     # Timeout for reading a response
-        .build()
-    )
+    """Starts the bot."""
+    LOGGER.info("Starting bot...")
 
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CommandHandler("ping",  cmd_ping))
+    # Register command handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("new", new_command))
 
-    # Messages (text only)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Register message handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Membership changes (bot added/removed → my_chat_member)
-    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-
-    # Errors
-    app.add_error_handler(error_handler)
-
-    async def _post_init(app_: Application):
-        # Ensure webhook mode is OFF and clear pending updates to avoid conflicts
-        try:
-            await app_.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-        # Optional: set commands
-        try:
-            await app_.bot.set_my_commands([
-                ("start", "Check bot status (group-only)"),
-                ("help",  "Show help"),
-                ("ping",  "Health check"),
-            ])
-        except Exception as e:
-            log.warning(f"Failed to set commands: {e}")
-
-    app.post_init = _post_init
-
-    log.info(f"Bot starting (group-only, REPLY_MODE={REPLY_MODE}, DM_POLICY={DM_POLICY}).")
-    # Drop any leftover updates and poll cleanly
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    LOGGER.info("Bot is polling for updates.")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
