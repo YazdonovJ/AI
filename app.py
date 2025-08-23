@@ -65,7 +65,7 @@ def user_is_allowed(func):
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
         if ALLOWED_USERS and user_id not in ALLOWED_USERS:
-            await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+            await update.message.reply_text(" you are not authorized to use this bot.")
             LOGGER.warning("Unauthorized access attempt by user_id: %s", user_id)
             return
         return await func(update, context, *args, **kwargs)
