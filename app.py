@@ -15,9 +15,7 @@ BOT_ROLE = "SAT tutor at SAT Makon"
 BOT_TRAITS = "smart, humorous, supportive, and witty"
 
 # ================== SYSTEM INSTRUCTIONS LOADING ==================
-# 1) If SYSTEM_PROMPT (env) exists, use it
-# 2) Else read SYSTEM_FILE (default: system_instructions.txt)
-# 3) Else fall back to a safe default
+# Priority: SYSTEM_PROMPT (env) > system_instructions.txt > default text
 DEFAULT_SYSTEM_PERSONA = (
     f"You are {BOT_NAME} {BOT_SURNAME}, an AI assistant and {BOT_ROLE}. "
     f"Your lord is {BOT_LORD} (SAT teacher). "
@@ -112,7 +110,7 @@ async def addressed_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     In groups/supergroups, reply only when:
       - message mentions 'james' (case-insensitive) or @bot_username
       - OR it's a reply to a message from this bot
-    Commands (/start, /vocab, etc.) are handled separately by command handlers.
+    Commands (/...) are handled by command handlers separately.
     """
     chat_type = update.effective_chat.type if update.effective_chat else ""
     if chat_type not in ("group", "supergroup"):
@@ -132,6 +130,20 @@ async def addressed_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         and update.message.reply_to_message.from_user.id == context.bot.id
     )
     return bool(mentioned or replied_to_bot)
+
+def is_skip(s: str) -> bool:
+    """Treat SKIP, SKIP., SKIP.MODE, SKIP: etc. as SKIP."""
+    if not s:
+        return False
+    t = s.strip().upper()
+    return t == "SKIP" or t.startswith("SKIP")
+
+def brief_fallback(username: str, name: str, photo: bool = False) -> str:
+    """Very short witty fallback used in groups if model returns SKIP but we were addressed."""
+    my_lord = (username == "yazdon_ov") or ("yazdonov" in (name or "").lower())
+    if photo:
+        return "Looks good, my lord. Study after dessert?" if my_lord else "Looks good. Study after dessert?"
+    return "Tempting, my lord. What flavor?" if my_lord else "Tempting. What flavor?"
 
 # ================== Commands ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,7 +197,7 @@ async def vocab_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"text": f"{BOT_NAME}:"},
     ]
     txt = await ask(prompt, temp=0.7)
-    if txt.strip().upper() != "SKIP":
+    if not is_skip(txt):
         await update.message.reply_text(txt)
 
 async def reading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,7 +210,7 @@ async def reading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"text": f"{BOT_NAME}:"},
     ]
     txt = await ask(prompt, temp=0.8)
-    if txt.strip().upper() != "SKIP":
+    if not is_skip(txt):
         await update.message.reply_text(txt)
 
 # ================== Message & Photo ==================
@@ -211,7 +223,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
 
-    # Include username/name for persona logic (e.g., “my lord” for @yazdon_ov)
     username = (update.effective_user.username or "").lower()
     name = (getattr(update.effective_user, "full_name", None) or update.effective_user.first_name or "").strip()
 
@@ -222,8 +233,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = build_prompt(uid, msg_for_prompt)
     reply = await ask(parts)
 
-    # SKIP handling (model decided not to answer)
-    if reply and reply.strip().upper() == "SKIP":
+    # Robust SKIP handling
+    if is_skip(reply):
+        # In DMs, respect SKIP silently; in groups (we were addressed), send tiny witty fallback
+        chat_type = update.effective_chat.type if update.effective_chat else ""
+        if chat_type in ("group", "supergroup"):
+            return await update.message.reply_text(brief_fallback(username, name))
         return
 
     USER[uid].history.append((BOT_NAME, reply))
@@ -238,7 +253,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
 
-    # Include username/name in vision prompt (use caption if present)
     username = (update.effective_user.username or "").lower()
     name = (getattr(update.effective_user, "full_name", None) or update.effective_user.first_name or "").strip()
     caption = (update.message.caption or "").strip()
@@ -259,7 +273,10 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply = await ask(parts)
 
-    if reply and reply.strip().upper() == "SKIP":
+    if is_skip(reply):
+        chat_type = update.effective_chat.type if update.effective_chat else ""
+        if chat_type in ("group", "supergroup"):
+            return await update.message.reply_text(brief_fallback(username, name, photo=True))
         return
 
     USER[uid].history.append((BOT_NAME, reply))
