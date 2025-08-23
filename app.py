@@ -16,15 +16,15 @@ XAI_API_KEY    = os.getenv("XAI_API_KEY", "").strip()
 XAI_MODEL      = os.getenv("XAI_MODEL", "grok-3-mini").strip()
 
 # DMs policy: "ignore" (default) or "warn"
-DM_POLICY      = os.getenv("DM_POLICY", "ignore").strip().lower()  # ignore | warn
-# Reply gating inside groups: reply_or_mention | mention | all
-REPLY_MODE     = os.getenv("REPLY_MODE", "reply_or_mention").strip().lower()
+DM_POLICY  = os.getenv("DM_POLICY", "ignore").strip().lower()  # ignore | warn
+# Group reply gating: reply_or_mention | mention | all
+REPLY_MODE = os.getenv("REPLY_MODE", "reply_or_mention").strip().lower()
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("Set TELEGRAM_TOKEN in your environment.")
 
 # ── LOGGING ────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%%(asctime)s %%(levelname)s %%(name)s: %%(message)s")
 for n in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(n).setLevel(logging.WARNING)
 log = logging.getLogger("group-only-bot")
@@ -81,7 +81,7 @@ async def call_xai(prompt: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello, group! I respond only in groups.\n"
-        "Default: I answer when you reply to me or @mention me.\n"
+        "Default behavior: reply when you @mention me or reply to my message.\n"
         "Try /help for commands."
     )
 
@@ -169,8 +169,13 @@ def main():
     # Errors
     app.add_error_handler(error_handler)
 
-    # Optional: set bot commands in UI
     async def _post_init(app_: Application):
+        # Ensure webhook mode is OFF and clear pending updates to avoid conflicts
+        try:
+            await app_.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        # Optional: set commands
         try:
             await app_.bot.set_my_commands([
                 ("start", "Check bot status (group-only)"),
@@ -179,10 +184,15 @@ def main():
             ])
         except Exception as e:
             log.warning(f"Failed to set commands: {e}")
+
     app.post_init = _post_init
 
     log.info(f"Bot starting (group-only, REPLY_MODE={REPLY_MODE}, DM_POLICY={DM_POLICY}).")
-    app.run_polling()
+    # Drop any leftover updates and poll cleanly
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
     main()
