@@ -1,30 +1,38 @@
-# app.py — Grok (xAI) version, stable & simple
+# app.py — Grok (xAI) version, hardened for bad env values
 import os, logging
 from typing import List
-
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from openai import OpenAI
 
-# -------- ENV --------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-XAI_API_KEY    = os.getenv("XAI_API_KEY", "").strip()
-XAI_MODEL      = os.getenv("XAI_MODEL", "grok-3-mini").strip()
-PRIVATE_PROMPT_FILES = os.getenv("PRIVATE_PROMPT_FILES", "").strip()
+# ---------- helpers to read/clean env ----------
+def _clean_env(name: str, default: str = "") -> str:
+    v = os.getenv(name, default)
+    v = (v if v is not None else default).strip().strip('"').strip("'")
+    if v.startswith("="):  # common copy/paste mistake from .env lines
+        v = v[1:]
+    return v
 
-if not TELEGRAM_TOKEN or not XAI_API_KEY:
-    raise SystemExit("Set TELEGRAM_TOKEN and XAI_API_KEY in Railway → Variables.")
+TELEGRAM_TOKEN       = _clean_env("TELEGRAM_TOKEN")
+XAI_API_KEY          = _clean_env("XAI_API_KEY")
+XAI_MODEL            = _clean_env("XAI_MODEL", "grok-3-mini")
+PRIVATE_PROMPT_FILES = _clean_env("PRIVATE_PROMPT_FILES", "")
 
-# -------- LOGGING --------
+if not TELEGRAM_TOKEN:
+    raise SystemExit("Missing TELEGRAM_TOKEN in Railway → Variables")
+if not XAI_API_KEY or not XAI_API_KEY.startswith("xai-"):
+    raise SystemExit("XAI_API_KEY is missing or malformed (must start with 'xai-'). Fix it in Railway → Variables.")
+
+# ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
 for n in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(n).setLevel(logging.WARNING)
 log = logging.getLogger("james-grok")
 
-# -------- OpenAI-compatible client pointed at xAI --------
-from openai import OpenAI
+# ---------- xAI client ----------
 client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# -------- SYSTEM INSTRUCTIONS --------
+# ---------- system instructions ----------
 def _read(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -51,17 +59,17 @@ DEFAULT_SYSTEM = (
 )
 BASE_SYSTEM = _read("system_instructions.txt") or DEFAULT_SYSTEM
 
-def load_private_stack(names_csv: str) -> str:
+def _stack(names_csv: str) -> str:
     if not names_csv:
         return ""
-    chunks = []
+    parts = []
     for name in [x.strip() for x in names_csv.split(",") if x.strip()]:
         t = _read(name)
         if t:
-            chunks.append(t)
-    return "\n\n".join(chunks)
+            parts.append(t)
+    return "\n\n".join(parts)
 
-PRIVATE_STACK = load_private_stack(PRIVATE_PROMPT_FILES)
+PRIVATE_STACK = _stack(PRIVATE_PROMPT_FILES)
 
 def system_for(update: Update) -> str:
     parts = [BASE_SYSTEM]
@@ -69,36 +77,27 @@ def system_for(update: Update) -> str:
         parts.append(PRIVATE_STACK)
     return "\n\n".join(parts)
 
-# -------- HELPERS --------
+# ---------- group addressing ----------
 async def addressed_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    In groups, reply only when mentioned or when the user replies to the bot.
-    Use effective_message to avoid NoneType crashes on non-message updates.
-    """
     chat = update.effective_chat
     m = update.effective_message
     if not chat or chat.type not in ("group", "supergroup"):
-        return True            # DMs: respond normally
+        return True
     if not m:
-        return False           # not a message update -> ignore
-
+        return False
     text = (m.text or m.caption or "").lower()
     me = await context.bot.get_me()
     uname = (me.username or "").lower()
-
     mentioned = ("james" in text) or (f"@{uname}" in text)
-    replied = bool(
-        getattr(m, "reply_to_message", None)
-        and getattr(m.reply_to_message, "from_user", None)
-        and m.reply_to_message.from_user.id == context.bot.id
-    )
+    replied = bool(getattr(m, "reply_to_message", None)
+                   and getattr(m.reply_to_message, "from_user", None)
+                   and m.reply_to_message.from_user.id == context.bot.id)
     return mentioned or replied
 
 def is_skip(s: str) -> bool:
     return bool(s) and s.strip().upper().startswith("SKIP")
 
 def chat_call(messages: List[dict], temperature: float = 0.6) -> str:
-    """Call Grok chat completion; return text or ''."""
     try:
         resp = client.chat.completions.create(
             model=XAI_MODEL,
@@ -110,31 +109,22 @@ def chat_call(messages: List[dict], temperature: float = 0.6) -> str:
         log.exception("Grok error: %s", e)
         return ""
 
-# -------- COMMANDS --------
+# ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     if not m: return
-    await m.reply_text(
-        "Hi! I’m James — your SAT Reading & Writing helper.\n"
-        "In groups, mention “James” or reply to me. I skip math."
-    )
+    await m.reply_text("Hi! I’m James — your SAT Reading & Writing helper. Mention “James” in groups. I skip math.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     if not m: return
-    await m.reply_text(
-        "/help — this message\n"
-        "Group replies: mention “James” or @<bot> or reply to me.\n"
-        "I focus on SAT Reading & Writing (R&W)."
-    )
+    await m.reply_text("/help — this message\nMention “James” or reply to me in groups.\nFocus: SAT Reading & Writing.")
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quick health check: pings Grok and tells you if API works."""
     m = update.effective_message
     if not m: return
-    sys = "You are a helpful system. Reply with exactly: OK"
     out = chat_call(
-        [{"role": "system", "content": sys},
+        [{"role": "system", "content": "Reply exactly with OK"},
          {"role": "user", "content": "Say OK"}],
         temperature=0.0
     )
@@ -143,18 +133,15 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await m.reply_text("Diag: Grok not responding. Check XAI_API_KEY / XAI_MODEL / logs.")
 
-# -------- HANDLERS --------
+# ---------- handlers ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
-
     m = update.effective_message
     if not m: return
-
     username = (update.effective_user.username or "").lower()
     name = (update.effective_user.first_name or "").strip()
     msg = m.text or ""
-
     sys = system_for(update)
     messages = [
         {"role": "system", "content": sys},
@@ -169,19 +156,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
-
     m = update.effective_message
     if not m: return
-
-    # Vision kept off for cost-safety. You can add Base64 vision later.
     await m.reply_text("Vision is off right now. Send the text of the question instead 🙂")
 
-# -------- MAIN --------
+# ---------- main ----------
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("diag", diag_cmd))   # health check
+    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     logging.info("James (Grok) started.")
