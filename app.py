@@ -211,9 +211,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return  # stay silent
 
+    # --- NEW: include username/name signals for persona logic ---
+    username = (update.effective_user.username or "").lower()
+    name = (getattr(update.effective_user, "full_name", None) or update.effective_user.first_name or "").strip()
+
     msg = update.message.text or ""
     USER[uid].history.append(("Student", msg))
-    parts = build_prompt(uid, msg)
+
+    msg_for_prompt = f"[username=@{username}] [name={name}] {msg}".strip()
+    parts = build_prompt(uid, msg_for_prompt)
     reply = await ask(parts)
 
     # --- SKIP logic ---
@@ -232,6 +238,12 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
 
+    # --- NEW: include username/name signals for persona logic ---
+    username = (update.effective_user.username or "").lower()
+    name = (getattr(update.effective_user, "full_name", None) or update.effective_user.first_name or "").strip()
+    caption = (update.message.caption or "").strip()
+    caption_for_prompt = f"[username=@{username}] [name={name}] {caption}".strip()
+
     file = await context.bot.get_file(update.message.photo[-1].file_id)
     b = await file.download_as_bytearray()
     img = Image.open(io.BytesIO(b))
@@ -241,6 +253,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"text": MODES.get(USER[uid].mode, MODES["tutor"])},
         {"text": ("Analyze this SAT question image. If MCQ, pick the best option and explain briefly. "
                   "If reading, summarize first, then answer likely question types succinctly.")},
+        {"text": caption_for_prompt},
         img,
         {"text": f"{BOT_NAME}:"},
     ]
