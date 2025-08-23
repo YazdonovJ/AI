@@ -3,7 +3,7 @@ import os
 import logging
 from typing import Optional
 
-from telegram import Update
+from telegram import Update, error
 from telegram.constants import ChatType
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -24,7 +24,7 @@ if not TELEGRAM_TOKEN:
     raise SystemExit("Set TELEGRAM_TOKEN in your environment.")
 
 # ── LOGGING ────────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%%(asctime)s %%(levelname)s %%(name)s: %%(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 for n in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(n).setLevel(logging.WARNING)
 log = logging.getLogger("group-only-bot")
@@ -134,7 +134,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(reply)
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error", exc_info=context.error)
+    """Log Errors and provide specific feedback for network issues."""
+    # This is the most likely error you are facing.
+    if isinstance(context.error, error.NetworkError):
+        log.error(
+            "A network error occurred. This is likely a connectivity issue. "
+            "Please check the server's internet connection and firewall settings. Error: %s",
+            context.error
+        )
+    else:
+        # For all other errors, log them as exceptions.
+        log.error("Exception while handling an update:", exc_info=context.error)
+
 
 # Fires when the bot is added/removed (my_chat_member update)
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,7 +164,16 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # ADDED: Timeouts to the application builder for network resilience.
+    # This prevents the bot from hanging indefinitely if Telegram's API is unresponsive.
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(10)  # Timeout for establishing a connection
+        .read_timeout(10)     # Timeout for reading a response
+        .build()
+    )
+
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
