@@ -1,4 +1,4 @@
-# app.py — Telegram bot (group-only replies), python-telegram-bot v20+
+# app.py — Telegram bot (group-only + mention/reply gating), PTB v20+
 import os
 import logging
 from typing import Optional
@@ -14,7 +14,11 @@ from telegram.ext import (
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 XAI_API_KEY    = os.getenv("XAI_API_KEY", "").strip()
 XAI_MODEL      = os.getenv("XAI_MODEL", "grok-3-mini").strip()
+
+# DMs policy: "ignore" (default) or "warn"
 DM_POLICY      = os.getenv("DM_POLICY", "ignore").strip().lower()  # ignore | warn
+# Reply gating inside groups: reply_or_mention | mention | all
+REPLY_MODE     = os.getenv("REPLY_MODE", "reply_or_mention").strip().lower()
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("Set TELEGRAM_TOKEN in your environment.")
@@ -36,6 +40,8 @@ def group_only(handler_func):
         ctype = getattr(chat, "type", None)
         if ctype in GROUP_TYPES:
             return await handler_func(update, context)
+
+        # Private (DM) path
         if DM_POLICY == "warn" and update.effective_message:
             try:
                 await update.effective_message.reply_text(
@@ -46,16 +52,37 @@ def group_only(handler_func):
         return
     return wrapper
 
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def _mentioned(bot_username: str, update: Update) -> bool:
+    """True if message mentions @bot_username (entity or text_mention)."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return False
+
+    # entity-based mention
+    for e in (msg.entities or []):
+        if e.type == "mention":
+            if msg.parse_entity(e).lstrip("@").lower() == bot_username.lower():
+                return True
+        elif e.type == "text_mention":
+            if getattr(e.user, "username", "").lower() == bot_username.lower():
+                return True
+
+    # fallback substring check
+    return f"@{bot_username.lower()}" in msg.text.lower()
+
 # ── (Optional) LLM call stub ──────────────────────────────────────────────────
 async def call_xai(prompt: str) -> str:
+    """Replace with real xAI/Grok call if desired."""
     return f"Echo: {prompt[:400]}"
 
 # ── HANDLERS ──────────────────────────────────────────────────────────────────
 @group_only
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hello, group! I’m alive and will only respond in groups. 🚀\n"
-        "Use /help to see what I can do."
+        "Hello, group! I respond only in groups.\n"
+        "Default: I answer when you reply to me or @mention me.\n"
+        "Try /help for commands."
     )
 
 @group_only
@@ -63,7 +90,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/start — check bot status\n"
         "/ping — quick health check\n"
-        "Just @mention me or talk in the thread; I’ll reply here (not in DMs)."
+        "Talk to me by replying to my message or @mentioning my username."
     )
 
 @group_only
@@ -72,17 +99,44 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @group_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
+    msg = update.effective_message
+    if not msg or not (msg.text or "").strip():
         return
+
+    # ignore other bots / self
+    if msg.from_user and msg.from_user.is_bot:
+        return
+
+    # decide if we should reply
+    should_reply = False
+    mode = REPLY_MODE
+    me = await context.bot.get_me()
+    bot_username = me.username or ""
+
+    if mode == "all":
+        should_reply = True
+    elif mode == "mention":
+        should_reply = _mentioned(bot_username, update)
+    else:  # reply_or_mention (default)
+        replied_to_bot = (
+            msg.reply_to_message
+            and msg.reply_to_message.from_user
+            and msg.reply_to_message.from_user.id == context.bot.id
+        )
+        should_reply = replied_to_bot or _mentioned(bot_username, update)
+
+    if not should_reply:
+        return  # stay silent
+
+    text = msg.text.strip()
     reply = await call_xai(text)
     if reply:
-        await update.message.reply_text(reply)
+        await msg.reply_text(reply)
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error", exc_info=context.error)
 
-# Correct handler for my_chat_member updates (when bot is added/removed)
+# Fires when the bot is added/removed (my_chat_member update)
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     cmu = update.my_chat_member  # ChatMemberUpdated
@@ -115,7 +169,7 @@ def main():
     # Errors
     app.add_error_handler(error_handler)
 
-    # Optional: set bot commands
+    # Optional: set bot commands in UI
     async def _post_init(app_: Application):
         try:
             await app_.bot.set_my_commands([
@@ -127,9 +181,8 @@ def main():
             log.warning(f"Failed to set commands: {e}")
     app.post_init = _post_init
 
-    log.info("Bot starting (group-only mode).")
+    log.info(f"Bot starting (group-only, REPLY_MODE={REPLY_MODE}, DM_POLICY={DM_POLICY}).")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-    
