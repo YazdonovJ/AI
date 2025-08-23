@@ -25,6 +25,7 @@ DEFAULT_SYSTEM_PERSONA = (
 )
 
 SYSTEM_FILE = os.getenv("SYSTEM_FILE", "system_instructions.txt")
+# Optional stacks (comma-separated files). Missing files are ignored.
 PRIVATE_PROMPT_FILES = os.getenv("PRIVATE_PROMPT_FILES", "inst_private.txt")
 GROUP_PROMPT_FILES   = os.getenv("GROUP_PROMPT_FILES",   "inst_group.txt")
 VISION_PROMPT_FILES  = os.getenv("VISION_PROMPT_FILES",  "inst_vision.txt")
@@ -81,8 +82,10 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(GEMINI_MODEL)
 
-# ================== Logging ==================
+# ================== Logging (quiet noisy libs) ==================
 logging.basicConfig(level=logging.INFO)
+for noisy in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("james-bot")
 
 # ================== User state ==================
@@ -117,7 +120,6 @@ async def ask(parts: list, temp: float = 0.6) -> str:
         return "I couldn’t form a reply—try again?"
 
 async def ask_banter(system_text: str, user_msg: str) -> str:
-    """Ask for a tiny witty reply (2–12 words). Never SKIP."""
     parts = [
         {"text": system_text},
         {"text": ("You were addressed casually in a group. "
@@ -140,8 +142,7 @@ async def addressed_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_type = update.effective_chat.type if update.effective_chat else ""
     if chat_type not in ("group", "supergroup"):
         return True
-    text = (getattr(update.message, "text", None) or
-            getattr(update.message, "caption", None) or "")
+    text = (getattr(update.message, "text", None) or getattr(update.message, "caption", None) or "")
     text_l = text.lower()
     me = await context.bot.get_me()
     bot_username = me.username.lower() if me.username else ""
@@ -267,11 +268,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = await ask(parts)
 
     if is_skip(reply):
-        # second try: short witty banter via dedicated prompt
         banter = await ask_banter(system_text, msg_for_prompt)
         if not is_skip(banter) and "couldn’t form a reply" not in banter:
             return await update.message.reply_text(banter)
-        # final fallback (no model)
         return await update.message.reply_text(brief_fallback(username, name))
 
     USER[uid].history.append((BOT_NAME, reply))
@@ -328,7 +327,11 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     logging.info("James Makonian bot started.")
-    app.run_polling()
+    app.run_polling(
+        poll_interval=2.0,   # less chatty logs when idle
+        timeout=30,          # long-poll timeout
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 if __name__ == "__main__":
     main()
