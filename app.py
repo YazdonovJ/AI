@@ -1,4 +1,4 @@
-# app.py — Minimal, robust Telegram bot (PTB v20.7) with optional xAI Grok
+# app.py — Telegram bot (PTB v20.7) with xAI Grok + mention-only in groups
 import os
 import logging
 from collections import defaultdict
@@ -41,13 +41,30 @@ INST_DEFAULT = _load_text("inst_default.txt", "You are a helpful assistant.")
 # ── Simple in‑memory history per chat ─────────────────────────────────────────
 history: Dict[int, List[dict]] = defaultdict(list)
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _mentioned(update: Update, bot_username: str) -> bool:
+    """True if the message mentions @bot_username via entities or text."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return False
+
+    # Check entity mentions
+    for e in (msg.entities or []):
+        if e.type == "mention":
+            if msg.parse_entity(e).lstrip("@").lower() == bot_username.lower():
+                return True
+        elif e.type == "text_mention" and e.user and e.user.username:
+            if e.user.username.lower() == bot_username.lower():
+                return True
+
+    # Fallback substring check
+    return f"@{bot_username.lower()}" in msg.text.lower()
+
 # ── AI generation (xAI Grok if available; otherwise Echo) ─────────────────────
 async def ai_generate(system_prompt: str, messages: List[dict]) -> str:
     """
-    If XAI_API_KEY is set and httpx is available, call xAI Grok.
-    Otherwise, safely fall back to echoing the last user message.
+    If XAI_API_KEY is set, call xAI Grok; otherwise echo last user message.
     """
-    # Fallback: echo last user message
     def _echo() -> str:
         last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
         return f"Echo: {last_user[:400]}"
@@ -56,9 +73,9 @@ async def ai_generate(system_prompt: str, messages: List[dict]) -> str:
         return _echo()
 
     try:
-        import httpx  # lazy import so httpx is optional
+        import httpx  # requires httpx==0.27.0
     except Exception:
-        LOG.warning("httpx is not installed; falling back to Echo mode.")
+        LOG.warning("httpx not installed; falling back to Echo.")
         return _echo()
 
     url = "https://api.x.ai/v1/chat/completions"
@@ -82,7 +99,7 @@ async def ai_generate(system_prompt: str, messages: List[dict]) -> str:
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hi! I’m alive and can chat in DMs and groups.\n"
+        "Hi! I’m alive. I answer in DMs, and in groups when mentioned.\n"
         "Use /new to clear history, /help for commands."
     )
 
@@ -100,16 +117,25 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
+    msg  = update.effective_message
     chat_id = chat.id
-    text = (update.message.text or "").strip()
+    text = (msg.text or "").strip()
     if not text:
         return
 
-    # Choose prompt based on chat type (DM vs group)
-    if chat.type == constants.ChatType.PRIVATE:
-        system_prompt = INST_PRIVATE or INST_DEFAULT
-    else:
-        system_prompt = INST_GROUP or INST_DEFAULT
+    # GROUP RULE: reply only when mentioned OR when user replies to the bot
+    if chat.type != constants.ChatType.PRIVATE:
+        me = await context.bot.get_me()
+        is_reply_to_bot = (
+            msg.reply_to_message
+            and msg.reply_to_message.from_user
+            and msg.reply_to_message.from_user.id == context.bot.id
+        )
+        if not (is_reply_to_bot or _mentioned(update, me.username or "")):
+            return  # stay silent in group
+
+    # Choose prompt based on chat type
+    system_prompt = (INST_PRIVATE if chat.type == constants.ChatType.PRIVATE else INST_GROUP) or INST_DEFAULT
 
     # Append user msg to per‑chat history
     history[chat_id].append({"role": "user", "content": text})
@@ -120,10 +146,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         reply = await ai_generate(system_prompt, history[chat_id])
         history[chat_id].append({"role": "assistant", "content": reply})
-        await update.message.reply_text(reply)
+        await msg.reply_text(reply)
     except Exception:
         LOG.exception("Unexpected error in handle_text")
-        await update.message.reply_text("Unexpected error. Please try again.")
+        await msg.reply_text("Unexpected error. Please try again.")
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     LOG.exception("Unhandled error", exc_info=context.error)
@@ -144,7 +170,7 @@ def main():
     # Global error handler
     app.add_error_handler(on_error)
 
-    # Ensure no leftover webhook; drop queued updates to avoid conflicts
+    # Ensure no leftover webhook; drop queued updates to avoid getUpdates conflicts
     async def _post_init(a: Application):
         try:
             await a.bot.delete_webhook(drop_pending_updates=True)
