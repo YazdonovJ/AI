@@ -1,6 +1,11 @@
 import os, io, time, logging, random, re, json
 from collections import defaultdict, deque, Counter
-from PIL import Image
+
+# --- Pillow is optional at import time (prevents startup crash) ---
+try:
+    from PIL import Image
+except Exception:   # noqa
+    Image = None
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -25,7 +30,6 @@ DEFAULT_SYSTEM_PERSONA = (
 )
 
 SYSTEM_FILE = os.getenv("SYSTEM_FILE", "system_instructions.txt")
-# Optional stacks (comma-separated files). Missing files are ignored.
 PRIVATE_PROMPT_FILES = os.getenv("PRIVATE_PROMPT_FILES", "inst_private.txt")
 GROUP_PROMPT_FILES   = os.getenv("GROUP_PROMPT_FILES",   "inst_group.txt")
 VISION_PROMPT_FILES  = os.getenv("VISION_PROMPT_FILES",  "inst_vision.txt")
@@ -38,11 +42,11 @@ def _read_file(path: str) -> str:
         return ""
 
 def load_base_persona() -> str:
-    env_persona = os.getenv("SYSTEM_PROMPT")
-    if env_persona and env_persona.strip():
-        return env_persona.strip()
-    file_persona = _read_file(SYSTEM_FILE)
-    return file_persona if file_persona else DEFAULT_SYSTEM_PERSONA
+    env_persona = os.getenv("SYSTEM_PROMPT", "").strip()
+    if env_persona:
+        return env_persona
+    txt = _read_file(SYSTEM_FILE)
+    return txt if txt else DEFAULT_SYSTEM_PERSONA
 
 def load_stack(csv_names: str) -> str:
     if not csv_names:
@@ -72,20 +76,13 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "8"))
 COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "3.0"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# Optional “1600-mode” knobs (safe defaults if you had them before)
 SMART_MODE = os.getenv("SMART_MODE", "1") == "1"
 VOTE_N = int(os.getenv("VOTE_N", "3"))
 VERIFY_EXPLANATION = os.getenv("VERIFY_EXPLANATION", "1") == "1"
 
 # ================== ENV (Railway Variables) ==================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise SystemExit("Please set TELEGRAM_TOKEN and GEMINI_API_KEY as environment variables.")
-
-# ================== Gemini setup ==================
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(GEMINI_MODEL)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # ================== Logging (quiet noisy libs) ==================
 logging.basicConfig(level=logging.INFO)
@@ -93,7 +90,21 @@ for noisy in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("james-bot")
 
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    log.error("Missing env vars. Set TELEGRAM_TOKEN and GEMINI_API_KEY in Railway → Variables.")
+    # Keep process alive so you can see logs, but do not start bot
+    time.sleep(3600)
+
+# ================== Gemini setup ==================
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+except Exception as e:
+    log.exception("Gemini init failed: %s", e)
+    time.sleep(3600)
+
 # ================== User state ==================
+from collections import defaultdict, deque
 class UState:
     def __init__(self):
         self.mode = "tutor"
@@ -112,14 +123,7 @@ def _last_user_snippet(parts: list) -> str:
     return "Student: (context lost) Please answer helpfully within allowed policies."
 
 def _slim_prompt_from(parts: list) -> list:
-    """If a call fails/blocks, retry with a minimal safe prompt."""
     student_line = _last_user_snippet(parts)
-    # keep the last image if any
-    last_img = None
-    for p in reversed(parts):
-        if hasattr(p, "size") and hasattr(p, "mode"):  # crude PIL check
-            last_img = p
-            break
     slim = [
         {"text": load_base_persona()},
         {"text": "Answer helpfully. Focus on SAT Reading & Writing. "
@@ -128,20 +132,12 @@ def _slim_prompt_from(parts: list) -> list:
         {"text": student_line},
         {"text": f"{BOT_NAME}:"},
     ]
-    if last_img is not None:
-        slim.insert(3, last_img)
     return slim
 
 def _is_generic_fail(txt: str) -> bool:
     return isinstance(txt, str) and "couldn’t form a reply" in txt.lower()
 
 async def ask(parts: list, temp: float = 0.6, tries: int = 2) -> str:
-    """
-    Robust wrapper:
-    - try main prompt
-    - on empty/blocked/error -> retry once with a slim prompt & lower temp
-    - never return the generic failure string
-    """
     attempt = 0
     cur_parts = parts
     cur_temp = temp
@@ -157,16 +153,11 @@ async def ask(parts: list, temp: float = 0.6, tries: int = 2) -> str:
             log.warning("Gemini returned empty text (attempt %d)", attempt + 1)
         except Exception as e:
             log.exception("Gemini error (attempt %d): %s", attempt + 1, e)
-
-        # Prepare next attempt
         attempt += 1
         cur_parts = _slim_prompt_from(parts)
         cur_temp = 0.3
-
-    # Last-resort safe line (short & useful; NO generic wording)
     return "Sorry—hit a hiccup reading that. Try rephrasing or send a clearer photo."
 
-# Tiny banter generator (used when model says SKIP or fails in groups)
 async def ask_banter(system_text: str, user_msg: str) -> str:
     parts = [
         {"text": system_text},
@@ -175,8 +166,7 @@ async def ask_banter(system_text: str, user_msg: str) -> str:
         {"text": f"Student: {user_msg}"},
         {"text": f"{BOT_NAME}:"},
     ]
-    txt = await ask(parts, temp=0.9, tries=1)
-    return txt
+    return await ask(parts, temp=0.9, tries=1)
 
 def cooled(user_id: int) -> bool:
     now = time.time()
@@ -224,7 +214,7 @@ def brief_fallback(username: str, name: str, photo: bool = False) -> str:
     base = random.choice(picks_photo if photo else picks_text)
     return base.replace("?", ", my lord?") if my_lord else base
 
-# ================== (Optional) 1600 helpers kept ==================
+# ================== “1600” helpers (kept) ==================
 ROUTER_SYSTEM = (
     "You are a strict router for SAT messages.\n"
     "Classify the user text into one of: 'rw' (reading & writing), 'math', 'offtopic'.\n"
@@ -238,7 +228,7 @@ def extract_letter(s: str) -> str:
 
 async def majority_vote_mcq(system_text: str, q_text: str, n: int = 3) -> str:
     votes = []
-    ask_parts_base = [
+    base = [
         {"text": system_text},
         {"text": ("You are solving an SAT Reading & Writing multiple-choice question. "
                   "Respond with ONLY the single best option letter (A/B/C/D). No words.")},
@@ -246,19 +236,18 @@ async def majority_vote_mcq(system_text: str, q_text: str, n: int = 3) -> str:
         {"text": f"{BOT_NAME}:"},
     ]
     for _ in range(max(1, n)):
-        out = await ask(ask_parts_base, temp=0.6)
+        out = await ask(base, temp=0.6)
         letter = extract_letter(out)
         if letter:
             votes.append(letter)
     if not votes:
-        out = await ask(ask_parts_base, temp=0.2)
+        out = await ask(base, temp=0.2)
         letter = extract_letter(out)
         if letter:
             votes.append(letter)
     if not votes:
         return ""
-    cnt = Counter(votes)
-    best, _ = cnt.most_common(1)[0]
+    best = Counter(votes).most_common(1)[0][0]
     return best
 
 async def verify_and_explain(system_text: str, q_text: str, letter: str) -> str:
@@ -267,7 +256,7 @@ async def verify_and_explain(system_text: str, q_text: str, letter: str) -> str:
         {"text": ("You already chose an answer. Explain briefly:\n"
                   f"- Start with 'Answer: {letter}'.\n"
                   "- Give 2–4 short reasons/evidence (cite words/lines when helpful).\n"
-                  "- Finish with 'Takeaway: ...' in one short line.")},
+                  "- Finish with 'Takeaway: ...' one short line.")},
         {"text": f"Question:\n{q_text}"},
         {"text": f"{BOT_NAME}:"},
     ]
@@ -355,7 +344,7 @@ async def vocab_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     txt = await ask(prompt, temp=0.7)
     if is_skip(txt) or _is_generic_fail(txt):
-        txt = "Here are 10 study words to warm up: focus, infer, revise, ..."
+        txt = "Takeaway: build vocabulary daily—small, steady wins."
     await update.message.reply_text(txt)
 
 async def reading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -370,7 +359,7 @@ async def reading_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     txt = await ask(prompt, temp=0.8)
     if is_skip(txt) or _is_generic_fail(txt):
-        txt = "Takeaway: read for main idea first; then evidence; then function."
+        txt = "Takeaway: read for main idea → evidence → function."
     await update.message.reply_text(txt)
 
 # ================== Message & Photo ==================
@@ -390,7 +379,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     system_text = persona_for(update, is_photo=False)
     msg_for_prompt = f"[username=@{username}] [name={name}] {msg}".strip()
 
-    # Optional router: keep behavior if you had it
+    # Router (optional but useful)
     route = {"type": "rw", "is_mcq": False}
     if SMART_MODE:
         router_json = await ask(
@@ -420,9 +409,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             banter = brief_fallback(username, name)
         return await update.message.reply_text(banter)
 
-    # R&W path
     if route.get("is_mcq", False):
-        # Majority vote + verify
         letter = await majority_vote_mcq(system_text, msg_for_prompt, n=VOTE_N if SMART_MODE else 1)
         if not letter:
             letter = extract_letter(await ask(
@@ -457,6 +444,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
 
+    if Image is None:
+        return await update.message.reply_text("Image analysis unavailable on this server. Send text instead!")
+
     username = (update.effective_user.username or "").lower()
     name = (getattr(update.effective_user, "full_name", None) or update.effective_user.first_name or "").strip()
     caption = (update.message.caption or "").strip()
@@ -468,7 +458,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     system_text = persona_for(update, is_photo=True)
 
-    # Simple router on caption
     route = {"type": "rw", "is_mcq": False}
     if SMART_MODE:
         router_json = await ask(
@@ -528,11 +517,8 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     logging.info("James Makonian bot started.")
-    app.run_polling(
-        poll_interval=2.0,   # less chatty logs when idle
-        timeout=30,          # long-poll timeout
-        allowed_updates=Update.ALL_TYPES,
-    )
+    # Simpler polling (some hosts crash with allowed_updates)
+    app.run_polling(poll_interval=2.0, timeout=30)
 
 if __name__ == "__main__":
     main()
