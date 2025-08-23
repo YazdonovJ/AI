@@ -1,15 +1,14 @@
-# app.py — Grok (xAI) version, hardened for bad env values
+# app.py — Grok (xAI) version, hardened + webhook clear to avoid conflicts
 import os, logging
 from typing import List
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 
-# ---------- helpers to read/clean env ----------
 def _clean_env(name: str, default: str = "") -> str:
     v = os.getenv(name, default)
     v = (v if v is not None else default).strip().strip('"').strip("'")
-    if v.startswith("="):  # common copy/paste mistake from .env lines
+    if v.startswith("="):
         v = v[1:]
     return v
 
@@ -21,18 +20,15 @@ PRIVATE_PROMPT_FILES = _clean_env("PRIVATE_PROMPT_FILES", "")
 if not TELEGRAM_TOKEN:
     raise SystemExit("Missing TELEGRAM_TOKEN in Railway → Variables")
 if not XAI_API_KEY or not XAI_API_KEY.startswith("xai-"):
-    raise SystemExit("XAI_API_KEY is missing or malformed (must start with 'xai-'). Fix it in Railway → Variables.")
+    raise SystemExit("XAI_API_KEY is missing or malformed (must start with 'xai-').")
 
-# ---------- logging ----------
 logging.basicConfig(level=logging.INFO)
 for n in ("httpx", "httpcore", "telegram", "telegram.ext", "telegram.request"):
     logging.getLogger(n).setLevel(logging.WARNING)
 log = logging.getLogger("james-grok")
 
-# ---------- xAI client ----------
 client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-# ---------- system instructions ----------
 def _read(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -77,7 +73,6 @@ def system_for(update: Update) -> str:
         parts.append(PRIVATE_STACK)
     return "\n\n".join(parts)
 
-# ---------- group addressing ----------
 async def addressed_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
     m = update.effective_message
@@ -109,7 +104,6 @@ def chat_call(messages: List[dict], temperature: float = 0.6) -> str:
         log.exception("Grok error: %s", e)
         return ""
 
-# ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     if not m: return
@@ -118,7 +112,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     if not m: return
-    await m.reply_text("/help — this message\nMention “James” or reply to me in groups.\nFocus: SAT Reading & Writing.")
+    await m.reply_text("/help — mention “James” or reply to me in groups.\nFocus: SAT Reading & Writing.")
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
@@ -128,12 +122,8 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
          {"role": "user", "content": "Say OK"}],
         temperature=0.0
     )
-    if out == "OK":
-        await m.reply_text(f"Diag: OK (model={XAI_MODEL})")
-    else:
-        await m.reply_text("Diag: Grok not responding. Check XAI_API_KEY / XAI_MODEL / logs.")
+    await m.reply_text(f"Diag: {'OK (model='+XAI_MODEL+')' if out=='OK' else 'Grok not responding; check variables/logs.'}")
 
-# ---------- handlers ----------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await addressed_in_group(update, context):
         return
@@ -160,9 +150,16 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m: return
     await m.reply_text("Vision is off right now. Send the text of the question instead 🙂")
 
-# ---------- main ----------
+# --- delete any webhook before polling to avoid conflicts/webhook leftovers
+async def post_init(app: Application):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Webhook deleted (drop_pending_updates=True).")
+    except Exception as e:
+        logging.warning("delete_webhook failed: %s", e)
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
