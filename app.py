@@ -1,7 +1,8 @@
-# app.py — Minimal, robust Telegram bot (PTB v20.7)
+# app.py — Minimal, robust Telegram bot (PTB v20.7) with optional xAI Grok
 import os
 import logging
 from collections import defaultdict
+from typing import Dict, List
 
 from telegram import Update, constants
 from telegram.ext import (
@@ -19,11 +20,11 @@ LOG = logging.getLogger("bot")
 
 # ── Environment ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-XAI_API_KEY    = (os.getenv("XAI_API_KEY") or "").strip()   # optional
+XAI_API_KEY    = (os.getenv("XAI_API_KEY") or "").strip()       # optional
 XAI_MODEL      = (os.getenv("XAI_MODEL") or "grok-3-mini").strip()
 
 if not TELEGRAM_TOKEN:
-    raise SystemExit("Set TELEGRAM_TOKEN in Railway → Variables (or env).")
+    raise SystemExit("Set TELEGRAM_TOKEN in your environment (Railway → Variables).")
 
 # ── Optional system prompts (files are optional; safe defaults) ───────────────
 def _load_text(path: str, default: str = "") -> str:
@@ -38,17 +39,45 @@ INST_GROUP   = _load_text("inst_group.txt",   "You are concise and polite in gro
 INST_DEFAULT = _load_text("inst_default.txt", "You are a helpful assistant.")
 
 # ── Simple in‑memory history per chat ─────────────────────────────────────────
-history: dict[int, list[dict]] = defaultdict(list)
+history: Dict[int, List[dict]] = defaultdict(list)
 
-# ── (Optional) place to call an LLM later; safe Echo fallback for now ─────────
-async def ai_generate(system_prompt: str, messages: list[dict]) -> str:
+# ── AI generation (xAI Grok if available; otherwise Echo) ─────────────────────
+async def ai_generate(system_prompt: str, messages: List[dict]) -> str:
     """
-    Replace this with a real API call if/when you want (e.g., xAI Grok).
-    For now it just echoes the user's latest message so the bot never fails.
+    If XAI_API_KEY is set and httpx is available, call xAI Grok.
+    Otherwise, safely fall back to echoing the last user message.
     """
-    last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
-    # Example stubbed behavior:
-    return f"Echo: {last_user[:400]}"
+    # Fallback: echo last user message
+    def _echo() -> str:
+        last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+        return f"Echo: {last_user[:400]}"
+
+    if not XAI_API_KEY:
+        return _echo()
+
+    try:
+        import httpx  # lazy import so httpx is optional
+    except Exception:
+        LOG.warning("httpx is not installed; falling back to Echo mode.")
+        return _echo()
+
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {XAI_API_KEY}"}
+    payload = {
+        "model": XAI_MODEL,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+            content = data["choices"][0]["message"]["content"].strip()
+            return content or _echo()
+    except Exception as e:
+        LOG.error("xAI request failed: %s", e)
+        return _echo()
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -76,7 +105,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Choose prompt based on chat type
+    # Choose prompt based on chat type (DM vs group)
     if chat.type == constants.ChatType.PRIVATE:
         system_prompt = INST_PRIVATE or INST_DEFAULT
     else:
@@ -92,7 +121,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = await ai_generate(system_prompt, history[chat_id])
         history[chat_id].append({"role": "assistant", "content": reply})
         await update.message.reply_text(reply)
-    except Exception as e:
+    except Exception:
         LOG.exception("Unexpected error in handle_text")
         await update.message.reply_text("Unexpected error. Please try again.")
 
