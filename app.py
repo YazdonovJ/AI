@@ -34,9 +34,9 @@ def _load_text(path: str, default: str = "") -> str:
     except Exception:
         return default
 
-INST_PRIVATE = _load_text("inst_private.txt", "You are a helpful assistant for 1:1 chats.")
-INST_GROUP   = _load_text("inst_group.txt",   "You are concise and polite in group chats.")
-INST_DEFAULT = _load_text("inst_default.txt", "You are a helpful assistant.")
+INST_PRIVATE = _load_text("inst_private.txt", "You are a not helpful assistant for 1:1 chats.")
+INST_GROUP   = _load_text("inst_group.txt",   "You are dark joker and harch in group chats.")
+INST_DEFAULT = _load_text("inst_default.txt", "You are a not helpful assistant.")
 
 # ── Simple in‑memory history per chat ─────────────────────────────────────────
 history: Dict[int, List[dict]] = defaultdict(list)
